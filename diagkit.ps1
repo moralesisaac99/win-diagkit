@@ -7,14 +7,15 @@
     y ejecucion directa remota via 'irm <url> | iex'.
 #>
 
+& {
 $ErrorActionPreference = "Continue"
 $ProgressPreference    = "SilentlyContinue"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 # ==============================================================================
 # CAPA 1: CONFIGURACION Y CONSTANTES (Single Source of Truth)
 # ==============================================================================
-$Script:Config = @{
+$Config = @{
     Version        = "2.0.0"
     SelfUrl        = "https://raw.githubusercontent.com/moralesguasca99/win-diagkit/main/diagkit.ps1"
     WorkDir        = "C:\WinDiagKit"
@@ -32,10 +33,12 @@ $Script:Config = @{
         RamFreePercentWarning     = 15
         StartupCountWarning       = 6
         DiskFreePercentWarning    = 20
+        DiskTempWarningC          = 60
+        DiskWearWarningPct        = 85
         MinExeSizeBytes           = 102400
     }
     Signatures     = @{
-        HeavyAvAndBloat = @("AvastSvc", "aswEngSrv", "TuneupSvc", "DriverUpdSvc", "McShield", "NortonSecurity", "ApCent", "AVG")
+        HeavyAvAndBloat = @("AvastSvc", "aswEngSrv", "TuneupSvc", "DriverUpdSvc", "McShield", "NortonSecurity", "ApCent", "AVGSvc", "AvgUi", "AVGToolsSvc")
         RemoteTools     = @("AnyDesk", "rustdesk", "TeamViewer", "tv_w32", "ScreenConnect")
         NonEssentialRun = @("Steam", "EpicGamesLauncher", "AvastBrowser", "MicrosoftEdge", "OneDrive", "Spotify", "Discord")
     }
@@ -51,7 +54,7 @@ function Test-IsAdmin {
 }
 
 function Request-ElevationIfNeeded {
-    if (Test-IsAdmin) { return $true }
+    if (Test-IsAdmin) { return "ADMIN" }
 
     Write-Host "`n[!] El script se esta ejecutando SIN permisos de Administrador." -ForegroundColor Yellow
     Write-Host "    Sin elevacion, Windows bloquea S.M.A.R.T., Minidumps y eventos WHEA." -ForegroundColor Gray
@@ -62,17 +65,18 @@ function Request-ElevationIfNeeded {
             if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
                 $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
             } else {
-                $argList = "-NoProfile -ExecutionPolicy Bypass -Command `"irm '$($Script:Config.SelfUrl)' | iex`""
+                $elevCmd = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; irm '$($Config.SelfUrl)' | iex"
+                $argList = "-NoProfile -ExecutionPolicy Bypass -Command `"$elevCmd`""
             }
             Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs -ErrorAction Stop
-            exit 0
+            return "ELEVATED"
         }
         catch {
             Write-Host "[!] No se pudo elevar (UAC cancelado). Continuando en modo limitado..." -ForegroundColor Yellow
             Start-Sleep -Seconds 2
         }
     }
-    return $false
+    return "LIMITED"
 }
 
 function Get-SafeProp {
@@ -91,11 +95,11 @@ function ConvertTo-HtmlSafe {
 
 function Get-ToolPath {
     param([ValidateSet("Specify", "ProcExp", "Autoruns")][string]$Tool)
-    if (-not (Test-Path $Script:Config.BinDir)) { return $null }
+    if (-not (Test-Path $Config.BinDir)) { return $null }
     switch ($Tool) {
-        "Specify"  { return (Get-ChildItem -Path $Script:Config.BinDir -Filter "Specify*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1) }
-        "ProcExp"  { return (Get-Item -Path (Join-Path $Script:Config.BinDir "procexp64.exe") -ErrorAction SilentlyContinue) }
-        "Autoruns" { return (Get-Item -Path (Join-Path $Script:Config.BinDir "autoruns64.exe") -ErrorAction SilentlyContinue) }
+        "Specify"  { return (Get-ChildItem -Path $Config.BinDir -Filter "Specify*.exe" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1) }
+        "ProcExp"  { return (Get-Item -Path (Join-Path $Config.BinDir "procexp64.exe") -ErrorAction SilentlyContinue) }
+        "Autoruns" { return (Get-Item -Path (Join-Path $Config.BinDir "autoruns64.exe") -ErrorAction SilentlyContinue) }
     }
 }
 
@@ -103,16 +107,26 @@ function Invoke-VerifiedDownload {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][string]$OutFile,
-        [string]$Label = "Archivo"
+        [string]$Label = "Archivo",
+        [switch]$RequireMicrosoftSignature
     )
     Write-Host "    Descargando $Label..." -ForegroundColor Cyan
-    $tmpFile = "$OutFile.tmp"
+    $parentDir = Split-Path -Path $OutFile -Parent
+    $leafName  = Split-Path -Path $OutFile -Leaf
+    $tmpFile   = Join-Path $parentDir (".tmp_" + $leafName)
     try {
-        Invoke-WebRequest -Uri $Uri -OutFile $tmpFile -Headers $Script:Config.Headers -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $Uri -OutFile $tmpFile -Headers $Config.Headers -UseBasicParsing -ErrorAction Stop
         $size = (Get-Item $tmpFile -ErrorAction Stop).Length
-        if ($size -lt $Script:Config.Thresholds.MinExeSizeBytes) {
+        if ($size -lt $Config.Thresholds.MinExeSizeBytes) {
             Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
             throw "Tamano invalido ($size bytes). Posible bloqueo de red o enlace roto."
+        }
+        if ($RequireMicrosoftSignature) {
+            $sig = Get-AuthenticodeSignature -FilePath $tmpFile -ErrorAction Stop
+            if ($sig.Status -ne "Valid" -or ($sig.SignerCertificate.Subject -notlike "*Microsoft*")) {
+                Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue
+                throw "Firma digital invalida o no emitida por Microsoft (Estado: $($sig.Status))."
+            }
         }
         Move-Item -Path $tmpFile -Destination $OutFile -Force
         Unblock-File -Path $OutFile -ErrorAction SilentlyContinue
@@ -147,7 +161,8 @@ function Get-NativeStorageAndEvents {
             $result.ExactUptimeHrs = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalHours, 1)
         }
         if ($os.TotalVisibleMemorySize -gt 0) {
-            $result.RamTotalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+            # TotalVisibleMemorySize viene en KB desde Win32_OperatingSystem
+            $result.RamTotalGB = [math]::Round(($os.TotalVisibleMemorySize * 1KB) / 1GB, 1)
             $result.RamFreePct = [math]::Round(($os.FreePhysicalMemory / $os.TotalVisibleMemorySize) * 100, 1)
         }
     } catch {}
@@ -215,16 +230,20 @@ function Get-NativeStorageAndEvents {
         }
     } catch {}
 
-    # Eventos criticos BSOD / Kernel-Power 41 / WHEA de los ultimos 14 dias
+    # Eventos criticos BSOD / Kernel-Power 41 / WHEA (incluyendo warnings corregidos 17/19) de los ultimos 14 dias
     try {
         $startTime = (Get-Date).AddDays(-14)
-        $events = @(Get-WinEvent -FilterHashtable @{
+        $rawEvents = @(Get-WinEvent -FilterHashtable @{
             LogName   = 'System'
-            Level     = 1, 2
+            Id        = 41, 1001, 17, 18, 19, 20
             StartTime = $startTime
-        } -MaxEvents 100 -ErrorAction Stop | Where-Object {
-            $_.ProviderName -in @('Microsoft-Windows-Kernel-Power', 'BugCheck', 'Microsoft-Windows-WHEA-Logger', 'WHEA-Logger') -or $_.Id -in @(41, 1001, 17, 18, 19)
-        } | Select-Object -First 10)
+        } -ErrorAction Stop)
+
+        $events = @($rawEvents | Where-Object {
+            ($_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 41) -or
+            ($_.ProviderName -eq 'BugCheck' -and $_.Id -eq 1001) -or
+            ($_.ProviderName -like '*WHEA-Logger*' -and $_.Id -in @(17, 18, 19, 20))
+        } | Select-Object -First 15)
 
         foreach ($ev in $events) {
             $msg = if ($ev.Message) { ($ev.Message -split "`r?`n")[0] } else { "Sin detalle" }
@@ -270,12 +289,15 @@ function ConvertFrom-SpecifyToCanonical {
     # RAM normalizada (solo modulos poblados)
     $ramModules = @()
     foreach ($r in @(Get-SafeProp $hw "Ram" @())) {
-        if ($r.Capacity -gt 0) {
+        $rawCap = [long](Get-SafeProp $r "Capacity" 0)
+        if ($rawCap -gt 0) {
+            $capMB = if ($rawCap -gt 10485760) { [long][math]::Round($rawCap / 1MB, 0) } else { $rawCap }
             $ramModules += [PSCustomObject]@{
                 Slot            = "$($r.BankLocator) / $($r.DeviceLocation)"
                 PartNumber      = ([string]$r.PartNumber).Trim()
                 ConfiguredSpeed = [int]$r.ConfiguredSpeed
-                CapacityMB      = [int]$r.Capacity
+                CapacityMB      = $capMB
+                IsSoldered      = $false
             }
         }
     }
@@ -348,11 +370,13 @@ function New-NativeOnlyCanonical {
     $ramModules = @()
     foreach ($r in $rams) {
         $speed = if ($r.ConfiguredClockSpeed) { [int]$r.ConfiguredClockSpeed } else { [int]$r.Speed }
+        $isSoldered = ($r.FormFactor -eq 24) -or ($r.SMBIOSMemoryType -in @(29, 30, 35))
         $ramModules += [PSCustomObject]@{
             Slot            = "$($r.BankLabel) / $($r.DeviceLocator)"
             PartNumber      = ([string]$r.PartNumber).Trim()
             ConfiguredSpeed = $speed
-            CapacityMB      = [int]($r.Capacity / 1MB)
+            CapacityMB      = [long][math]::Round($r.Capacity / 1MB, 0)
+            IsSoldered      = $isSoldered
         }
     }
 
@@ -367,7 +391,7 @@ function New-NativeOnlyCanonical {
 
     $startups = @()
     try {
-        foreach ($st in @(Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue)) {
+        foreach ($st in @(Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "desktop.ini" })) {
             $startups += [PSCustomObject]@{
                 AppName        = $st.Name
                 AppDescription = $st.Location
@@ -407,7 +431,7 @@ function New-NativeOnlyCanonical {
         Motherboard      = if ($mb) { "$($mb.Manufacturer) $($mb.Product)".Trim() } else { "N/A" }
         Gpus             = @($gpus | ForEach-Object { "$($_.Name) (Driver: $($_.DriverVersion))" })
         RamModules       = $ramModules
-        RamTotalGB       = $NativeExtra.RamTotalGB
+        RamTotalGB       = if ($NativeExtra.RamTotalGB) { $NativeExtra.RamTotalGB } elseif ($ramModules.Count -gt 0) { [math]::Round((($ramModules | Measure-Object CapacityMB -Sum).Sum) / 1024, 1) } else { $null }
         RamFreePct       = $NativeExtra.RamFreePct
         Processes        = $procs
         Services         = $services
@@ -457,23 +481,25 @@ function Invoke-HeuristicAnalysis {
     param([Parameter(Mandatory)]$Model)
 
     $findings = New-Object System.Collections.Generic.List[object]
-    $th       = $Script:Config.Thresholds
+    $th       = $Config.Thresholds
 
     # REGLA 1: Frecuencia RAM (XMP/DOCP) y Single Channel
     if ($Model.RamModules.Count -gt 0) {
-        if ($Model.RamModules.Count -eq 1) {
+        if ($Model.RamModules.Count -eq 1 -and -not $Model.RamModules[0].IsSoldered) {
             $findings.Add((New-Finding -Severity "WARNING" -Category "Memoria RAM" `
                 -Title "Memoria operando en Single Channel (1 solo modulo)" `
                 -Evidence "Solo se detecto 1 modulo instalado ($($Model.RamModules[0].CapacityMB) MB en $($Model.RamModules[0].Slot))." `
-                -Recommendation "Anadir un segundo modulo identico activa Dual Channel y mejora el rendimiento de CPU/graficos."))
+                -Recommendation "Anadir un segundo modulo identico activa Dual Channel y mejora el rendimiento de CPU/graficos. Nota: en portatiles con RAM soldada (LPDDR4/LPDDR5), SMBIOS puede reportar 1 solo bloque aunque opere en Dual/Quad Channel."))
         }
 
+        $validSpeedPattern = "(2133|2400|2666|2933|3000|3200|3466|3600|3733|3800|4000|4133|4266|4400|4600|4800|5200|5600|6000|6200|6400|6600|6800|7000|7200|7600|8000|8200|8400)"
         $xmpIssues = @()
         foreach ($mod in $Model.RamModules) {
             $nominal = 0
-            if ($mod.PartNumber -match "(?:DDR[45]-?|F[45]-|CM[A-Z0-9]*|KF[45])(\d{4})") {
-                $nominal = [int]$Matches[1]
-            } elseif ($mod.PartNumber -match "(?<!\d)(2400|2666|2933|3000|3200|3600|4000|4800|5200|5600|6000|6400)(?!\d)") {
+            if ($mod.PartNumber -match "KF[45](\d{2})[CS]") {
+                $candidate = ([int]$Matches[1]) * 100
+                if ($candidate -ge 2133 -and $candidate -le 9600) { $nominal = $candidate }
+            } elseif ($mod.PartNumber -match "(?<!\d)$validSpeedPattern(?!\d)") {
                 $nominal = [int]$Matches[1]
             }
             if ($nominal -gt 0 -and $mod.ConfiguredSpeed -gt 0 -and $mod.ConfiguredSpeed -lt $nominal) {
@@ -487,9 +513,10 @@ function Invoke-HeuristicAnalysis {
                 -Recommendation "Entra a la BIOS de la placa ($($Model.Motherboard)) y activa el perfil X.M.P. / D.O.C.P. Profile 1."))
         } else {
             $speeds = ($Model.RamModules.ConfiguredSpeed | Select-Object -Unique) -join "/"
+            $ramTotStr = if ($null -ne $Model.RamTotalGB) { "$($Model.RamTotalGB) GB" } else { "N/A" }
             $findings.Add((New-Finding -Severity "OK" -Category "Memoria RAM" `
                 -Title "Configuracion de frecuencia RAM consistente" `
-                -Evidence "$($Model.RamModules.Count) modulo(s) detectados a $speeds MHz (Total: $($Model.RamTotalGB) GB)." `
+                -Evidence "$($Model.RamModules.Count) modulo(s) detectados a $speeds MHz (Total: $ramTotStr)." `
                 -Recommendation "Sin acciones necesarias."))
         }
     }
@@ -527,15 +554,16 @@ function Invoke-HeuristicAnalysis {
     $memComp = ($Model.Processes | Where-Object { $_.Name -eq "Memory Compression" } | Measure-Object WorkingSetMB -Sum).Sum
     $memComp = [math]::Round($memComp, 1)
     if (($memComp -ge $th.MemCompressionWarningMB) -or ($null -ne $Model.RamFreePct -and $Model.RamFreePct -lt $th.RamFreePercentWarning)) {
+        $ramFreeTxt = if ($null -ne $Model.RamFreePct) { "$($Model.RamFreePct)%" } else { "N/A" }
         $findings.Add((New-Finding -Severity "WARNING" -Category "Rendimiento RAM" `
             -Title "Alta presion de memoria RAM en el equipo" `
-            -Evidence "Memory Compression: $memComp MB | RAM fisica libre actual: $($Model.RamFreePct)%." `
+            -Evidence "Memory Compression: $memComp MB | RAM fisica libre actual: $ramFreeTxt." `
             -Recommendation "Revisa la tabla de Top 10 consumidores reales abajo y cierra apps multi-proceso o pestanas innecesarias."))
     }
 
     # REGLA 5: Antivirus de terceros / Bloatware / Defender Pasivo
     $detectedBloat = @()
-    foreach ($sig in $Script:Config.Signatures.HeavyAvAndBloat) {
+    foreach ($sig in $Config.Signatures.HeavyAvAndBloat) {
         $hitProc = $Model.Processes | Where-Object { $_.Name -like "*$sig*" } | Select-Object -First 1
         $hitSvc  = $Model.Services  | Where-Object { $_.State -eq "Running" -and ($_.Name -like "*$sig*" -or $_.Caption -like "*$sig*") } | Select-Object -First 1
         if ($hitProc -or $hitSvc) { $detectedBloat += $sig }
@@ -555,7 +583,7 @@ function Invoke-HeuristicAnalysis {
 
     # REGLA 5B (Extra): Multiples clientes de acceso remoto activos simultaneamente
     $activeRemotes = @()
-    foreach ($rt in $Script:Config.Signatures.RemoteTools) {
+    foreach ($rt in $Config.Signatures.RemoteTools) {
         if ($Model.Processes | Where-Object { $_.Name -like "*$rt*" } | Select-Object -First 1) {
             $activeRemotes += $rt
         }
@@ -572,7 +600,7 @@ function Invoke-HeuristicAnalysis {
         $nonEss = @($Model.StartupTasks | Where-Object {
             $n = "$($_.AppName) $($_.ImagePath)"
             $matched = $false
-            foreach ($k in $Script:Config.Signatures.NonEssentialRun) { if ($n -like "*$k*") { $matched = $true; break } }
+            foreach ($k in $Config.Signatures.NonEssentialRun) { if ($n -like "*$k*") { $matched = $true; break } }
             $matched
         } | ForEach-Object { $_.AppName })
 
@@ -583,7 +611,7 @@ function Invoke-HeuristicAnalysis {
             -Recommendation "Deshabilita launchers y navegadores secundarios desde Administrador de tareas -> Aplicaciones de arranque o usando Autoruns (Opcion 3)."))
     }
 
-    # REGLA 7: Salud S.M.A.R.T. y saturacion de espacio en disco
+    # REGLA 7: Salud S.M.A.R.T. (estado, errores R/W, desgaste, temperatura) y espacio en disco
     $unhealthyDisks = @($Model.PhysicalDisks | Where-Object { $_.HealthStatus -and $_.HealthStatus -ne "Healthy" })
     if ($unhealthyDisks.Count -gt 0) {
         $desc = ($unhealthyDisks | ForEach-Object { "$($_.Model) [$($_.HealthStatus)]" }) -join ", "
@@ -592,6 +620,36 @@ function Invoke-HeuristicAnalysis {
             -Evidence $desc `
             -Recommendation "Realiza copia de seguridad inmediata de los datos criticos y planifica reemplazo de la unidad."))
     }
+
+    $rwErrorDisks = @($Model.PhysicalDisks | Where-Object {
+        ($null -ne $_.ReadErrors -and $_.ReadErrors -gt 0) -or ($null -ne $_.WriteErrors -and $_.WriteErrors -gt 0)
+    })
+    if ($rwErrorDisks.Count -gt 0) {
+        $rwDesc = ($rwErrorDisks | ForEach-Object { "$($_.Model) (Lectura: $($_.ReadErrors) / Escritura: $($_.WriteErrors))" }) -join " | "
+        $findings.Add((New-Finding -Severity "WARNING" -Category "Almacenamiento" `
+            -Title "Errores de lectura/escritura S.M.A.R.T. detectados en disco fisico" `
+            -Evidence $rwDesc `
+            -Recommendation "Respalda datos importantes, verifica el cable/puerto SATA o ranura M.2 y monitoriza si los contadores siguen aumentando."))
+    }
+
+    $wornDisks = @($Model.PhysicalDisks | Where-Object { $null -ne $_.WearPct -and $_.WearPct -ge $th.DiskWearWarningPct })
+    if ($wornDisks.Count -gt 0) {
+        $wearDesc = ($wornDisks | ForEach-Object { "$($_.Model) (Desgaste: $($_.WearPct)%)" }) -join " | "
+        $findings.Add((New-Finding -Severity "WARNING" -Category "Almacenamiento" `
+            -Title "Desgaste elevado en unidad de almacenamiento (S.M.A.R.T.)" `
+            -Evidence $wearDesc `
+            -Recommendation "El SSD se acerca al final de su vida util estimada (TBW). Manten copias de seguridad actualizadas y planifica su sustitucion."))
+    }
+
+    $hotDisks = @($Model.PhysicalDisks | Where-Object { $null -ne $_.TempC -and $_.TempC -gt 0 -and $_.TempC -ge $th.DiskTempWarningC })
+    if ($hotDisks.Count -gt 0) {
+        $hotDesc = ($hotDisks | ForEach-Object { "$($_.Model) ($($_.TempC) C)" }) -join " | "
+        $findings.Add((New-Finding -Severity "WARNING" -Category "Almacenamiento" `
+            -Title "Temperatura elevada en disco fisico (>= $($th.DiskTempWarningC) C)" `
+            -Evidence $hotDesc `
+            -Recommendation "Mejora el flujo de aire del chasis o instala un disipador termico (especialmente en unidades NVMe M.2) para evitar thermal throttling."))
+    }
+
     $lowVols = @($Model.Volumes | Where-Object { $_.FreePct -lt $th.DiskFreePercentWarning })
     if ($lowVols.Count -gt 0) {
         $vDesc = ($lowVols | ForEach-Object { "$($_.Drive) libre $($_.FreeGB) GB ($($_.FreePct)%)" }) -join " | "
@@ -642,13 +700,17 @@ function Show-ConsoleSummary {
     $critCount = @($Findings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
     $warnCount = @($Findings | Where-Object { $_.Severity -eq "WARNING" }).Count
 
+    $cpuLoadStr = if ($null -ne $Model.CpuLoadPct) { "$($Model.CpuLoadPct)%" } else { "N/A" }
+    $ramTotStr  = if ($null -ne $Model.RamTotalGB) { "$($Model.RamTotalGB) GB" } else { "N/A" }
+    $ramFreeStr = if ($null -ne $Model.RamFreePct) { "$($Model.RamFreePct)%" } else { "N/A" }
+
     Write-Host "`n============================================================" -ForegroundColor Cyan
     Write-Host "  RESUMEN EJECUTIVO: $($Model.Hostname)" -ForegroundColor White
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "  SO       : $($Model.OsEdition)" -ForegroundColor Gray
-    Write-Host "  CPU      : $($Model.CpuName) (Carga: $($Model.CpuLoadPct)%)" -ForegroundColor Gray
+    Write-Host "  CPU      : $($Model.CpuName) (Carga: $cpuLoadStr)" -ForegroundColor Gray
     Write-Host "  GPU      : $($Model.Gpus -join ' | ')" -ForegroundColor Gray
-    Write-Host "  RAM      : $($Model.RamTotalGB) GB (Libre: $($Model.RamFreePct)%)" -ForegroundColor Gray
+    Write-Host "  RAM      : $ramTotStr (Libre: $ramFreeStr)" -ForegroundColor Gray
     Write-Host "  Alertas  : $critCount Criticas | $warnCount Advertencias" -ForegroundColor $(if ($critCount -gt 0) { "Red" } elseif ($warnCount -gt 0) { "Yellow" } else { "Green" })
     Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
 
@@ -709,16 +771,22 @@ function Export-HtmlReport {
     # Tabla discos y volumenes
     $diskRows = New-Object System.Text.StringBuilder
     foreach ($d in $Model.PhysicalDisks) {
-        $tStr = if ($null -ne $d.TempC) { "$($d.TempC) C" } else { "N/A" }
-        $wStr = if ($null -ne $d.WearPct) { "$($d.WearPct)%" } else { "N/A" }
-        [void]$diskRows.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $d.Model)</td><td>$(ConvertTo-HtmlSafe $d.MediaType) / $(ConvertTo-HtmlSafe $d.BusType)</td><td>$($d.SizeGB) GB</td><td>$(ConvertTo-HtmlSafe $d.HealthStatus)</td><td>$tStr</td><td>$wStr</td></tr>")
+        $tStr  = if ($null -ne $d.TempC -and $d.TempC -gt 0) { "$($d.TempC) C" } else { "N/A" }
+        $wStr  = if ($null -ne $d.WearPct) { "$($d.WearPct)%" } else { "N/A" }
+        $rwStr = if ($null -ne $d.ReadErrors -or $null -ne $d.WriteErrors) {
+            $rVal = if ($null -ne $d.ReadErrors)  { $d.ReadErrors }  else { "N/A" }
+            $wVal = if ($null -ne $d.WriteErrors) { $d.WriteErrors } else { "N/A" }
+            "$rVal / $wVal"
+        } else { "N/A" }
+        [void]$diskRows.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $d.Model)</td><td>$(ConvertTo-HtmlSafe $d.MediaType) / $(ConvertTo-HtmlSafe $d.BusType)</td><td>$($d.SizeGB) GB</td><td>$(ConvertTo-HtmlSafe $d.HealthStatus)</td><td>$tStr</td><td>$wStr</td><td>$rwStr</td></tr>")
     }
-    if ($Model.PhysicalDisks.Count -eq 0) { [void]$diskRows.AppendLine("<tr><td colspan='6'>Sin lectura de discos fisicos (ejecuta como Administrador).</td></tr>") }
+    if ($Model.PhysicalDisks.Count -eq 0) { [void]$diskRows.AppendLine("<tr><td colspan='7'>Sin lectura de discos fisicos (ejecuta como Administrador).</td></tr>") }
 
     $volRows = New-Object System.Text.StringBuilder
     foreach ($v in $Model.Volumes) {
         [void]$volRows.AppendLine("<tr><td><strong>$(ConvertTo-HtmlSafe $v.Drive)</strong> $(ConvertTo-HtmlSafe $v.Label)</td><td>$($v.SizeGB) GB</td><td>$($v.FreeGB) GB</td><td>$($v.FreePct)%</td><td>$(ConvertTo-HtmlSafe $v.Health)</td></tr>")
     }
+    if ($Model.Volumes.Count -eq 0) { [void]$volRows.AppendLine("<tr><td colspan='5'>Sin lectura de volumenes.</td></tr>") }
 
     # Tabla arranque
     $startRows = New-Object System.Text.StringBuilder
@@ -734,8 +802,11 @@ function Export-HtmlReport {
     }
     if ($Model.CriticalEvents.Count -eq 0) { [void]$evRows.AppendLine("<tr><td colspan='4'>Sin eventos criticos BSOD/Kernel-Power/WHEA en los ultimos 14 dias.</td></tr>") }
 
-    $adminBadge = if ($Model.IsAdminCapture) { "Administrador: SI" } else { "Administrador: NO (Captura limitada)" }
-    $jsonFooter = if ($Model.SourceJsonPath) { "JSON crudo guardado en: $(ConvertTo-HtmlSafe $Model.SourceJsonPath)" } else { "Modo nativo offline (sin JSON externo)" }
+    $adminBadge  = if ($Model.IsAdminCapture) { "Administrador: SI" } else { "Administrador: NO (Captura limitada)" }
+    $jsonFooter  = if ($Model.SourceJsonPath) { "JSON crudo guardado en: $(ConvertTo-HtmlSafe $Model.SourceJsonPath)" } else { "Modo nativo offline (sin JSON externo)" }
+    $ramStatStr  = if ($null -ne $Model.RamTotalGB) { "$($Model.RamTotalGB) GB" } else { "N/A" }
+    $freeStatStr = if ($null -ne $Model.RamFreePct) { "$($Model.RamFreePct)%" } else { "N/A" }
+    $upStatStr   = if ($null -ne $Model.UptimeHours) { "$($Model.UptimeHours) horas" } else { "N/A" }
 
     $html = @"
 <!DOCTYPE html>
@@ -787,7 +858,7 @@ function Export-HtmlReport {
 <div class="wrap">
   <header>
     <div>
-      <h1>Win-DiagKit v$($Script:Config.Version) &mdash; $(ConvertTo-HtmlSafe $Model.Hostname)</h1>
+      <h1>Win-DiagKit v$($Config.Version) &mdash; $(ConvertTo-HtmlSafe $Model.Hostname)</h1>
       <div class="meta">$(ConvertTo-HtmlSafe $Model.SourceMode) &bull; $adminBadge &bull; $(ConvertTo-HtmlSafe $Model.GeneratedAt)</div>
     </div>
     <div class="badge $healthClass">$healthLabel</div>
@@ -798,8 +869,8 @@ function Export-HtmlReport {
     <div class="stat"><label>Procesador</label><span>$(ConvertTo-HtmlSafe $Model.CpuName)</span></div>
     <div class="stat"><label>Grafica(s)</label><span>$(ConvertTo-HtmlSafe ($Model.Gpus -join ' | '))</span></div>
     <div class="stat"><label>Placa Base / Plan</label><span>$(ConvertTo-HtmlSafe $Model.Motherboard) ($(ConvertTo-HtmlSafe $Model.PowerPlan))</span></div>
-    <div class="stat"><label>Memoria RAM</label><span>$($Model.RamTotalGB) GB (Libre: $($Model.RamFreePct)%)</span></div>
-    <div class="stat"><label>Uptime Exacto</label><span>$($Model.UptimeHours) horas</span></div>
+    <div class="stat"><label>Memoria RAM</label><span>$ramStatStr (Libre: $freeStatStr)</span></div>
+    <div class="stat"><label>Uptime Exacto</label><span>$upStatStr</span></div>
   </div>
 
   <h2>Hallazgos del Motor Heuristico</h2>
@@ -815,7 +886,7 @@ function Export-HtmlReport {
     <summary>Almacenamiento: Discos Fisicos (S.M.A.R.T.) y Volumenes</summary>
     <br>
     <table>
-      <thead><tr><th>Modelo</th><th>Tipo / Bus</th><th>Capacidad</th><th>Salud</th><th>Temp</th><th>Desgaste</th></tr></thead>
+      <thead><tr><th>Modelo</th><th>Tipo / Bus</th><th>Capacidad</th><th>Salud</th><th>Temp</th><th>Desgaste</th><th>Errores R/W</th></tr></thead>
       <tbody>$($diskRows.ToString())</tbody>
     </table>
     <table>
@@ -848,9 +919,10 @@ function Export-HtmlReport {
 </html>
 "@
 
-    $stamp      = (Get-Date).ToString("yyyyMMdd_HHmm")
+    $stamp      = (Get-Date).ToString("yyyyMMdd_HHmmss")
     $safeHost   = ($Model.Hostname -replace '[^a-zA-Z0-9_-]', '')
-    $outputPath = Join-Path $Script:Config.DesktopDir "Diagnostico_PC_${safeHost}_${stamp}.html"
+    if ([string]::IsNullOrWhiteSpace($safeHost)) { $safeHost = "EQUIPO" }
+    $outputPath = Join-Path $Config.DesktopDir "Diagnostico_PC_${safeHost}_${stamp}.html"
 
     $utf8NoBom  = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($outputPath, $html, $utf8NoBom)
@@ -861,16 +933,21 @@ function Export-HtmlReport {
 # CAPA 6: CASOS DE USO DEL MENU (Opciones 1 a 5)
 # ==============================================================================
 function Invoke-InstallKit {
-    Write-Host "`n[+] Preparando directorio aislado fuera de OneDrive: $($Script:Config.BinDir)" -ForegroundColor Cyan
-    New-Item -ItemType Directory -Force -Path $Script:Config.BinDir -ErrorAction Stop | Out-Null
+    Write-Host "`n[+] Preparando directorio aislado fuera de OneDrive: $($Config.BinDir)" -ForegroundColor Cyan
+    New-Item -ItemType Directory -Force -Path $Config.BinDir -ErrorAction Stop | Out-Null
 
     # 1. Specify (noring0)
     try {
-        $rel = Invoke-RestMethod -Uri $Script:Config.Urls.SpecifyApi -Headers $Script:Config.Headers -ErrorAction Stop
+        $rel = Invoke-RestMethod -Uri $Config.Urls.SpecifyApi -Headers $Config.Headers -ErrorAction Stop
         $asset = $rel.assets | Where-Object { $_.name -like "*noring0*.exe" } | Select-Object -First 1
         if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -like "*.exe" } | Select-Object -First 1 }
         if ($asset) {
-            Invoke-VerifiedDownload -Uri $asset.browser_download_url -OutFile (Join-Path $Script:Config.BinDir $asset.name) -Label "Specify ($($asset.name))" | Out-Null
+            $specOut = Join-Path $Config.BinDir $asset.name
+            if (Invoke-VerifiedDownload -Uri $asset.browser_download_url -OutFile $specOut -Label "Specify ($($asset.name))") {
+                Get-ChildItem -Path $Config.BinDir -Filter "Specify*.exe" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -ne $asset.name } |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+            }
         } else {
             Write-Host "    [ERROR] No se encontro ejecutable en el release de Specify." -ForegroundColor Red
         }
@@ -878,17 +955,17 @@ function Invoke-InstallKit {
         Write-Host "    [ERROR] Fallo consultando GitHub API para Specify: $($_.Exception.Message)" -ForegroundColor Red
     }
 
-    # 2. Sysinternals directos (sin ZIP ni conflictos de arquitectura)
-    Invoke-VerifiedDownload -Uri $Script:Config.Urls.ProcExp  -OutFile (Join-Path $Script:Config.BinDir "procexp64.exe")  -Label "Process Explorer (x64)" | Out-Null
-    Invoke-VerifiedDownload -Uri $Script:Config.Urls.Autoruns -OutFile (Join-Path $Script:Config.BinDir "autoruns64.exe") -Label "Autoruns (x64)" | Out-Null
+    # 2. Sysinternals directos (con validacion de firma digital Microsoft)
+    Invoke-VerifiedDownload -Uri $Config.Urls.ProcExp  -OutFile (Join-Path $Config.BinDir "procexp64.exe")  -Label "Process Explorer (x64)" -RequireMicrosoftSignature | Out-Null
+    Invoke-VerifiedDownload -Uri $Config.Urls.Autoruns -OutFile (Join-Path $Config.BinDir "autoruns64.exe") -Label "Autoruns (x64)"         -RequireMicrosoftSignature | Out-Null
 
-    Write-Host "`n[+] Despliegue finalizado en $($Script:Config.BinDir)." -ForegroundColor Green
+    Write-Host "`n[+] Despliegue finalizado en $($Config.BinDir)." -ForegroundColor Green
 }
 
 function Invoke-FullDiagnostic {
     $specExe = Get-ToolPath -Tool "Specify"
     if (-not $specExe) {
-        Write-Host "`n[!] Specify no esta instalado en $($Script:Config.BinDir)." -ForegroundColor Yellow
+        Write-Host "`n[!] Specify no esta instalado en $($Config.BinDir)." -ForegroundColor Yellow
         $ans = Read-Host "Deseas instalar el kit ahora? (S/N)"
         if ($ans -match "^[sS]$") {
             Invoke-InstallKit
@@ -906,9 +983,15 @@ function Invoke-FullDiagnostic {
     Write-Host "    3. Cierra la ventana de Specify para generar el analisis automatico." -ForegroundColor Yellow
 
     $scanStart = Get-Date
-    Start-Process -FilePath $specExe.FullName -WorkingDirectory $Script:Config.BinDir -Wait
+    try {
+        Start-Process -FilePath $specExe.FullName -WorkingDirectory $Config.BinDir -Wait -ErrorAction Stop
+    }
+    catch {
+        Write-Host "`n[ERROR] No se pudo ejecutar Specify (UAC cancelado o bloqueado por seguridad): $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
 
-    $jsonFile = Get-ChildItem -Path $Script:Config.BinDir -Filter "*.json" -ErrorAction SilentlyContinue |
+    $jsonFile = Get-ChildItem -Path $Config.BinDir -Filter "*.json" -ErrorAction SilentlyContinue |
                 Where-Object { $_.LastWriteTime -ge $scanStart } |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
@@ -918,6 +1001,7 @@ function Invoke-FullDiagnostic {
     }
 
     Write-Host "`n[+] Cruzando datos de Specify con S.M.A.R.T. y eventos nativos..." -ForegroundColor Cyan
+    $htmlPath = $null
     try {
         $rawJson    = Get-Content -Path $jsonFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
         $nativeData = Get-NativeStorageAndEvents
@@ -927,12 +1011,16 @@ function Invoke-FullDiagnostic {
 
         Show-ConsoleSummary -Model $model -Findings $findings -TopProcesses $topProcs
         $htmlPath = Export-HtmlReport -Model $model -Findings $findings -TopProcesses $topProcs
-
         Write-Host "[OK] Reporte visual generado en el Escritorio: $htmlPath" -ForegroundColor Green
-        Start-Process -FilePath $htmlPath
     }
     catch {
         Write-Host "[ERROR] No se pudo procesar el reporte: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    if ($htmlPath) {
+        try { Start-Process -FilePath $htmlPath -ErrorAction Stop }
+        catch { Write-Host "[!] Reporte guardado, pero no se pudo abrir el navegador automaticamente: $($_.Exception.Message)" -ForegroundColor Yellow }
     }
 }
 
@@ -945,32 +1033,38 @@ function Invoke-LiveInspection {
 
     $toolName = $null; $url = $null; $file = $null
     switch ($sub.ToUpper()) {
-        "A" { $toolName = "ProcExp";  $url = $Script:Config.Urls.ProcExp;  $file = "procexp64.exe" }
-        "B" { $toolName = "Autoruns"; $url = $Script:Config.Urls.Autoruns; $file = "autoruns64.exe" }
+        "A" { $toolName = "ProcExp";  $url = $Config.Urls.ProcExp;  $file = "procexp64.exe" }
+        "B" { $toolName = "Autoruns"; $url = $Config.Urls.Autoruns; $file = "autoruns64.exe" }
         default { return }
     }
 
     $exe = Get-ToolPath -Tool $toolName
     if (-not $exe) {
-        New-Item -ItemType Directory -Force -Path $Script:Config.BinDir | Out-Null
-        $out = Join-Path $Script:Config.BinDir $file
-        if (Invoke-VerifiedDownload -Uri $url -OutFile $out -Label $toolName) {
+        New-Item -ItemType Directory -Force -Path $Config.BinDir | Out-Null
+        $out = Join-Path $Config.BinDir $file
+        if (Invoke-VerifiedDownload -Uri $url -OutFile $out -Label $toolName -RequireMicrosoftSignature) {
             $exe = Get-Item $out
         }
     }
 
     if ($exe) {
         Write-Host "[+] Lanzando $($exe.Name)..." -ForegroundColor Green
-        if (Test-IsAdmin) {
-            Start-Process -FilePath $exe.FullName -ArgumentList "/accepteula"
-        } else {
-            Start-Process -FilePath $exe.FullName -ArgumentList "/accepteula" -Verb RunAs
+        try {
+            if (Test-IsAdmin) {
+                Start-Process -FilePath $exe.FullName -ArgumentList "/accepteula" -ErrorAction Stop
+            } else {
+                Start-Process -FilePath $exe.FullName -ArgumentList "/accepteula" -Verb RunAs -ErrorAction Stop
+            }
+        }
+        catch {
+            Write-Host "[ERROR] No se pudo iniciar $($exe.Name): $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 }
 
 function Invoke-NativeOfflineAudit {
     Write-Host "`n[+] Ejecutando auditoria 100% nativa (sin descargas externas)..." -ForegroundColor Cyan
+    $htmlPath = $null
     try {
         $nativeData = Get-NativeStorageAndEvents
         $model      = New-NativeOnlyCanonical -NativeExtra $nativeData
@@ -979,47 +1073,72 @@ function Invoke-NativeOfflineAudit {
 
         Show-ConsoleSummary -Model $model -Findings $findings -TopProcesses $topProcs
         $htmlPath = Export-HtmlReport -Model $model -Findings $findings -TopProcesses $topProcs
-
         Write-Host "[OK] Reporte visual generado en el Escritorio: $htmlPath" -ForegroundColor Green
-        Start-Process -FilePath $htmlPath
     }
     catch {
         Write-Host "[ERROR] Fallo en auditoria nativa: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+
+    if ($htmlPath) {
+        try { Start-Process -FilePath $htmlPath -ErrorAction Stop }
+        catch { Write-Host "[!] Reporte guardado, pero no se pudo abrir el navegador automaticamente: $($_.Exception.Message)" -ForegroundColor Yellow }
     }
 }
 
 function Invoke-ForensicCleanup {
+    Write-Host "`n[!] Esta accion detendra las herramientas del kit y eliminara:" -ForegroundColor Yellow
+    Write-Host "    - Carpeta $($Config.WorkDir)" -ForegroundColor Gray
+    Write-Host "    - Reportes Diagnostico_PC_*.html en el Escritorio" -ForegroundColor Gray
+    Write-Host "    - Claves de registro de Process Explorer y Autoruns" -ForegroundColor Gray
+    $confirm = Read-Host "Confirmas que deseas realizar la limpieza integral? (S/N)"
+    if ($confirm -notmatch "^[sS]$") {
+        Write-Host "[i] Limpieza cancelada por el usuario." -ForegroundColor Cyan
+        return
+    }
+
     Write-Host "`n[+] Deteniendo herramientas activas del kit..." -ForegroundColor Cyan
-    Get-Process -Name "Specify*", "procexp*", "autoruns*", "SystemInformer*" -ErrorAction SilentlyContinue |
+    Get-Process -Name "Specify*", "procexp*", "autoruns*" -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 600
 
     # 1. Eliminar carpeta de trabajo C:\WinDiagKit
-    if (Test-Path $Script:Config.WorkDir) {
+    if (Test-Path $Config.WorkDir) {
         try {
-            Remove-Item -Path $Script:Config.WorkDir -Recurse -Force -ErrorAction Stop
-            Write-Host "    [OK] Eliminado: $($Script:Config.WorkDir)" -ForegroundColor Green
+            Remove-Item -Path $Config.WorkDir -Recurse -Force -ErrorAction Stop
+            Write-Host "    [OK] Eliminado: $($Config.WorkDir)" -ForegroundColor Green
         } catch {
-            Write-Host "    [ERROR] No se pudo borrar $($Script:Config.WorkDir): $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "    [ERROR] No se pudo borrar $($Config.WorkDir): $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 
     # 2. Limpiar reportes en Escritorio y carpeta legacy DiagKit si existiera
-    $legacyDir = Join-Path $Script:Config.DesktopDir "DiagKit"
+    $legacyDir = Join-Path $Config.DesktopDir "DiagKit"
     if (Test-Path $legacyDir) {
         Remove-Item -Path $legacyDir -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host "    [OK] Eliminada carpeta previa: $legacyDir" -ForegroundColor Green
     }
-    Get-ChildItem -Path $Script:Config.DesktopDir -Filter "Diagnostico_PC_*.html" -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -Path $Config.DesktopDir -Filter "Diagnostico_PC_*.html" -ErrorAction SilentlyContinue | ForEach-Object {
         Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
         Write-Host "    [OK] Eliminado reporte: $($_.Name)" -ForegroundColor Green
     }
 
-    # 3. Limpiar claves de registro de Sysinternals
-    $sysIntKey = "HKCU:\Software\Sysinternals"
-    if (Test-Path $sysIntKey) {
-        Remove-Item -Path $sysIntKey -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "    [OK] Limpiado registro: $sysIntKey" -ForegroundColor Green
+    # 3. Limpiar solo claves de registro creadas por Process Explorer y Autoruns
+    $sysIntRoot = "HKCU:\Software\Sysinternals"
+    foreach ($subName in @("Process Explorer", "Autoruns")) {
+        $subKey = Join-Path $sysIntRoot $subName
+        if (Test-Path $subKey) {
+            Remove-Item -Path $subKey -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "    [OK] Limpiado registro: $subKey" -ForegroundColor Green
+        }
+    }
+    if (Test-Path $sysIntRoot) {
+        $remSub = @(Get-ChildItem -Path $sysIntRoot -ErrorAction SilentlyContinue)
+        $remVal = (Get-Item -Path $sysIntRoot -ErrorAction SilentlyContinue).Property
+        if ($remSub.Count -eq 0 -and (-not $remVal -or $remVal.Count -eq 0)) {
+            Remove-Item -Path $sysIntRoot -Force -ErrorAction SilentlyContinue
+            Write-Host "    [OK] Limpiada clave raiz vacia: $sysIntRoot" -ForegroundColor Green
+        }
     }
 
     Write-Host "`n[+] Limpieza integral completada." -ForegroundColor Green
@@ -1036,10 +1155,10 @@ function Show-MainMenu {
     $arOk     = if (Get-ToolPath -Tool "Autoruns") { "LISTO" } else { "NO INSTALADO" }
 
     Write-Host "=============================================================" -ForegroundColor Cyan
-    Write-Host "             WIN-DIAGKIT v$($Script:Config.Version) - AUDITORIA PC             " -ForegroundColor White
+    Write-Host "             WIN-DIAGKIT v$($Config.Version) - AUDITORIA PC             " -ForegroundColor White
     Write-Host "=============================================================" -ForegroundColor Cyan
-    Write-Host "  Binarios         : $($Script:Config.BinDir)" -ForegroundColor Gray
-    Write-Host "  Reportes         : $($Script:Config.DesktopDir)" -ForegroundColor Gray
+    Write-Host "  Binarios         : $($Config.BinDir)" -ForegroundColor Gray
+    Write-Host "  Reportes         : $($Config.DesktopDir)" -ForegroundColor Gray
     Write-Host "  Administrador    : $(if ($isAdmin) { 'SI (Acceso completo)' } else { 'NO (Modo limitado)' })" -ForegroundColor $(if ($isAdmin) { "Green" } else { "Yellow" })
     Write-Host "  Specify          : $specOk" -ForegroundColor $(if ($specOk -eq "LISTO") { "Green" } else { "DarkGray" })
     Write-Host "  Process Explorer : $peOk" -ForegroundColor $(if ($peOk -eq "LISTO") { "Green" } else { "DarkGray" })
@@ -1056,7 +1175,7 @@ function Show-MainMenu {
 }
 
 # --- Punto de entrada ---
-Request-ElevationIfNeeded | Out-Null
+if ((Request-ElevationIfNeeded) -eq "ELEVATED") { return }
 
 $running = $true
 while ($running) {
@@ -1072,4 +1191,5 @@ while ($running) {
         "0" { $running = $false }
         default { Write-Host "`nOpcion invalida." -ForegroundColor Red; Start-Sleep -Seconds 1 }
     }
+}
 }
